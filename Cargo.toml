@@ -1,0 +1,17 @@
+[package]
+name = "spotr-agent"
+version = "0.1.0"
+authors = ["dbregeon <denis.bregeon@digitalbrikes.com>"]
+edition = "2018"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+spotr-sensing = { path = "../spotr-sensing", version = "0.1.0" }
+libloading = "0.6.2"
+log = "0.4.11"
+env_logger = "0.7.1"
+toml = "0.5.6"
+serde = "1.0.115"
+serde_derive = "1.0.115"
+simple-error = "0.2.2"
