@@ -1,3 +1,5 @@
-[process_sensor]
+[sensors]
+
+[sensors.process_sensor]
 sensor = '../spotr-process-sensor/target/debug/libspotr_process_sensor.so'
 sample_interval = 5
