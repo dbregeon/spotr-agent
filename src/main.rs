@@ -10,15 +10,15 @@ use libloading::{Library, Symbol};
 use log::{debug, error, info, trace, warn};
 use serde_derive::Deserialize;
 use spotr_sensing::{Sensor, SensorOutput};
+use std::collections::HashMap;
 use std::sync::mpsc::{Receiver, Sender};
 use std::time::Duration;
-use std::collections::HashMap;
 
 type SensorHandle = std::thread::JoinHandle<Result<(), simple_error::SimpleError>>;
 
 #[derive(Deserialize, Clone)]
 struct Config {
-    sensors: HashMap<String, AgentSensorConfig>
+    sensors: HashMap<String, AgentSensorConfig>,
 }
 
 impl std::fmt::Display for Config {
@@ -34,6 +34,7 @@ impl std::fmt::Display for Config {
 struct AgentSensorConfig {
     sensor: String,
     sample_interval: u64,
+    details: Option<toml::Value>,
 }
 
 impl AgentSensorConfig {
@@ -63,11 +64,12 @@ impl AgentSensor {
     fn new(name: String, config: AgentSensorConfig) -> AgentSensor {
         let lib = Library::new(config.sensor.as_str())
             .expect(format!("Missing library {}", config.sensor).as_str());
+        let details_config = toml::to_string(&config.details).unwrap_or("".to_string());
         let sensor = unsafe {
-            let initialize: Symbol<unsafe extern "C" fn() -> *mut dyn Sensor> = lib
+            let initialize: Symbol<unsafe extern "C" fn(&str) -> *mut dyn Sensor> = lib
                 .get(b"initialize")
                 .expect(format!("Failed to initialize {}", config.sensor).as_str());
-            Box::from_raw(initialize())
+            Box::from_raw(initialize(details_config.as_str()))
         };
 
         AgentSensor {
@@ -105,7 +107,7 @@ fn start_publisher(receivers: Vec<Receiver<SensorOutput>>) -> SensorHandle {
                 std::thread::sleep(Duration::from_secs(1));
                 alive_receivers.iter().fold(
                     Vec::<&Receiver<SensorOutput>>::with_capacity(alive_receivers.len()),
-                    |mut list, rx | {
+                    |mut list, rx| {
                         let mut read = true;
                         let mut closed = false;
                         while !closed && read {
@@ -113,14 +115,20 @@ fn start_publisher(receivers: Vec<Receiver<SensorOutput>>) -> SensorHandle {
                                 Ok(sample) => {
                                     debug!("Read sample.");
                                     match sample {
-                                        SensorOutput::Process { pid } => println!("Process {}", pid),
-                                        SensorOutput::MountPoint { name, size, free } =>  println!("Mount {}: {} %", name, ((size - free) as f64 / size as f64) * 100.0)
+                                        SensorOutput::Process { pid, stat } => {
+                                            println!("Process {} {:?}", pid, stat)
+                                        }
+                                        SensorOutput::MountPoint { name, size, free } => println!(
+                                            "Mount {}: {} %",
+                                            name,
+                                            ((size - free) as f64 / size as f64) * 100.0
+                                        ),
                                     };
-                                },
+                                }
                                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                                     error!("Channel closed.");
                                     closed = true;
-                                },
+                                }
                                 Err(_) => {
                                     debug!("Empty Channel.");
                                     list.push(rx);
@@ -133,7 +141,7 @@ fn start_publisher(receivers: Vec<Receiver<SensorOutput>>) -> SensorHandle {
                             list.push(rx);
                         }
                         list
-                    }
+                    },
                 );
             }
             Ok(())
@@ -141,11 +149,7 @@ fn start_publisher(receivers: Vec<Receiver<SensorOutput>>) -> SensorHandle {
         .expect("Failed to start the publisher thread")
 }
 
-fn start_sensor(
-    name: String,
-    config: AgentSensorConfig,
-    tx: Sender<SensorOutput>,
-) -> SensorHandle {
+fn start_sensor(name: String, config: AgentSensorConfig, tx: Sender<SensorOutput>) -> SensorHandle {
     std::thread::Builder::new()
         .name(name.to_string())
         .spawn(move || {
@@ -166,14 +170,14 @@ fn main() {
     info!("{}", config);
 
     info!("spotr-agent starting");
-    let mut receivers = vec!();
-    let mut sensors = vec!();
+    let mut receivers = vec![];
+    let mut sensors = vec![];
     for sensor_config in config.sensors {
         let (tx, rx): (Sender<SensorOutput>, Receiver<SensorOutput>) = std::sync::mpsc::channel();
         receivers.push(rx);
         info!("Starting {}", sensor_config.0);
         sensors.push(start_sensor(sensor_config.0, sensor_config.1, tx));
-    };
+    }
     let publisher = start_publisher(receivers);
 
     info!("spotr-agent started");

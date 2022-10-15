@@ -3,3 +3,8 @@
 [sensors.process_sensor]
 sensor = '../spotr-process-sensor/target/debug/libspotr_process_sensor.so'
 sample_interval = 5
+
+[sensors.mount_sensor]
+sensor = '../spotr-mount-sensor/target/debug/libspotr_mount_sensor.so'
+sample_interval = 10
+details = { mount_points = ["/usr", "/home", "/tmp"] }
