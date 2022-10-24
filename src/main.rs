@@ -1,20 +1,22 @@
-extern crate env_logger;
-extern crate libloading;
-extern crate log;
-extern crate serde;
-extern crate serde_derive;
-extern crate simple_error;
-extern crate toml;
+mod metrics_registry;
 
+use futures::executor::block_on;
 use libloading::{Library, Symbol};
-use log::{debug, error, info, trace, warn};
+use log::{debug, error, info};
+use metrics_registry::MetricsRegistry;
+use prometheus::{Registry, TextEncoder};
 use serde_derive::Deserialize;
 use spotr_sensing::{Sensor, SensorOutput};
 use std::collections::HashMap;
 use std::sync::mpsc::{Receiver, Sender};
 use std::time::Duration;
+use tokio::runtime::Runtime;
+use tokio::task::JoinError;
+use warp::Filter;
 
 type SensorHandle = std::thread::JoinHandle<Result<(), simple_error::SimpleError>>;
+type CollectorHandle = std::thread::JoinHandle<Result<(), simple_error::SimpleError>>;
+type ReporterHandle = std::thread::JoinHandle<Result<(), JoinError>>;
 
 #[derive(Deserialize, Clone)]
 struct Config {
@@ -24,7 +26,7 @@ struct Config {
 impl std::fmt::Display for Config {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         for config in &self.sensors {
-            write!(f, "\n{}:\n{}", config.0, config.1).expect("Failed to fprmat config.");
+            write!(f, "\n{}:\n{}", config.0, config.1).expect("Failed to format config.");
         }
         Ok(())
     }
@@ -55,14 +57,14 @@ impl std::fmt::Display for AgentSensorConfig {
 
 struct AgentSensor {
     name: String,
-    lib: Library,
+    _lib: Library,
     interval: Duration,
     sensor: Box<dyn Sensor>,
 }
 
 impl AgentSensor {
     fn new(name: String, config: AgentSensorConfig) -> AgentSensor {
-        let lib = Library::new(config.sensor.as_str())
+        let lib = unsafe { Library::new(config.sensor.as_str()) }
             .expect(format!("Missing library {}", config.sensor).as_str());
         let details_config = toml::to_string(&config.details).unwrap_or("".to_string());
         let sensor = unsafe {
@@ -73,14 +75,14 @@ impl AgentSensor {
         };
 
         AgentSensor {
-            name: name,
-            lib: lib,
+            name,
+            _lib: lib,
             interval: config.interval(),
-            sensor: sensor,
+            sensor,
         }
     }
 
-    fn sample(&self, tx: &Sender<SensorOutput>) {
+    fn sample(&mut self, tx: &Sender<SensorOutput>) {
         info!("{} sampling", self.name);
         match self.sensor.sample() {
             Ok(samples) => {
@@ -97,11 +99,12 @@ impl AgentSensor {
     }
 }
 
-fn start_publisher(receivers: Vec<Receiver<SensorOutput>>) -> SensorHandle {
+fn start_collector(r: Registry, receivers: Vec<Receiver<SensorOutput>>) -> CollectorHandle {
     std::thread::Builder::new()
         .name("publisher".to_string())
         .spawn(move || {
-            let mut alive_receivers: Vec<&Receiver<SensorOutput>> = receivers.iter().collect();
+            let mut registry = MetricsRegistry::new(r);
+            let alive_receivers: Vec<&Receiver<SensorOutput>> = receivers.iter().collect();
             while !alive_receivers.is_empty() {
                 debug!("Sleeping between publishes");
                 std::thread::sleep(Duration::from_secs(1));
@@ -113,17 +116,8 @@ fn start_publisher(receivers: Vec<Receiver<SensorOutput>>) -> SensorHandle {
                         while !closed && read {
                             match rx.try_recv() {
                                 Ok(sample) => {
-                                    debug!("Read sample.");
-                                    match sample {
-                                        SensorOutput::Process { pid, stat } => {
-                                            println!("Process {} {:?}", pid, stat)
-                                        }
-                                        SensorOutput::MountPoint { name, size, free } => println!(
-                                            "Mount {}: {} %",
-                                            name,
-                                            ((size - free) as f64 / size as f64) * 100.0
-                                        ),
-                                    };
+                                    debug!("Read sample {:?}", sample);
+                                    registry.record(sample).unwrap();
                                 }
                                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                                     error!("Channel closed.");
@@ -153,13 +147,30 @@ fn start_sensor(name: String, config: AgentSensorConfig, tx: Sender<SensorOutput
     std::thread::Builder::new()
         .name(name.to_string())
         .spawn(move || {
-            let sensor = AgentSensor::new(name, config);
+            let mut sensor = AgentSensor::new(name, config);
             loop {
                 sensor.sample(&tx);
                 std::thread::sleep(sensor.interval);
             }
         })
         .expect(format!("Failed to start the sensor thread.").as_str())
+}
+
+fn start_reporter(registry: Registry) -> ReporterHandle {
+    std::thread::Builder::new()
+        .name("reporter".to_string())
+        .spawn(move || {
+            let rt = Runtime::new().unwrap();
+            let prometheus = warp::path!("prometheus" / "metrics").map(move || {
+                let encoder = TextEncoder::new();
+                encoder
+                    .encode_to_string(&registry.gather())
+                    .unwrap()
+                    .to_string()
+            });
+            block_on(rt.spawn(warp::serve(prometheus).run(([0, 0, 0, 0], 8000))))
+        })
+        .expect("Failed to start the reporter thread")
 }
 
 fn main() {
@@ -178,14 +189,25 @@ fn main() {
         info!("Starting {}", sensor_config.0);
         sensors.push(start_sensor(sensor_config.0, sensor_config.1, tx));
     }
-    let publisher = start_publisher(receivers);
+
+    let registry = Registry::new_custom(Some("spotr".to_string()), None)
+        .expect("Failed to create metrics registry");
+    let collector = start_collector(registry.clone(), receivers);
+    let reporter = start_reporter(registry);
 
     info!("spotr-agent started");
 
-    publisher.join().expect("Failed to join publisher thread");
+    collector
+        .join()
+        .expect("Failed to join publisher thread")
+        .unwrap();
     for sensor in sensors {
-        sensor.join().expect("Failed to join sensor thread");
+        sensor
+            .join()
+            .expect("Failed to join sensor thread")
+            .unwrap();
     }
+    reporter.join().expect("Failed to join reporter").unwrap();
 
     info!("spotr-agent exiting");
 }
